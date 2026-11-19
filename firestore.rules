@@ -1,0 +1,293 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidDateStr(s) {
+      return s is string && s.size() == 10 && s.matches('^\\d{4}-\\d{2}-\\d{2}$');
+    }
+
+    function hasLedgerAccess(userId, ledgerId) {
+      return isOwner(userId)
+        && exists(/databases/$(database)/documents/users/$(userId)/ledgers/$(ledgerId))
+        && get(/databases/$(database)/documents/users/$(userId)/ledgers/$(ledgerId)).data.ownerId == request.auth.uid;
+    }
+
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'displayName', 'photoURL', 'updatedAt'])
+        && data.uid is string
+        && data.uid == userId
+        && isValidId(data.uid)
+        && data.email is string
+        && data.email.size() >= 3
+        && data.email.size() <= 200
+        && data.displayName is string
+        && data.displayName.size() >= 1
+        && data.displayName.size() <= 120
+        && (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 500))
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidLedger(data, userId) {
+      return data.keys().hasAll([
+          'ownerId', 'name', 'segment', 'location', 'ownerName', 'referenceDate', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'name', 'segment', 'location', 'ownerName', 'referenceDate', 'createdAt', 'updatedAt'
+        ])
+        && data.ownerId is string
+        && data.ownerId == userId
+        && isValidId(data.ownerId)
+        && data.name is string
+        && data.name.size() >= 1
+        && data.name.size() <= 120
+        && data.segment is string
+        && data.segment.size() >= 1
+        && data.segment.size() <= 120
+        && data.location is string
+        && data.location.size() >= 1
+        && data.location.size() <= 120
+        && data.ownerName is string
+        && data.ownerName.size() >= 1
+        && data.ownerName.size() <= 120
+        && isValidDateStr(data.referenceDate)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidInvoice(data, userId, ledgerId) {
+      return data.keys().hasAll([
+          'ownerId', 'ledgerId', 'invoiceNumber', 'customerName', 'customerCity',
+          'customerPhone', 'issueDate', 'dueDate', 'amount', 'paidAmount', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'ledgerId', 'invoiceNumber', 'customerName', 'customerCity',
+          'customerPhone', 'issueDate', 'dueDate', 'amount', 'paidAmount',
+          'lastPaymentDate', 'notes', 'createdAt', 'updatedAt'
+        ])
+        && data.ownerId is string
+        && data.ownerId == userId
+        && isValidId(data.ownerId)
+        && data.ledgerId is string
+        && data.ledgerId == ledgerId
+        && isValidId(data.ledgerId)
+        && data.invoiceNumber is string
+        && data.invoiceNumber.size() >= 1
+        && data.invoiceNumber.size() <= 64
+        && data.customerName is string
+        && data.customerName.size() >= 1
+        && data.customerName.size() <= 120
+        && data.customerCity is string
+        && data.customerCity.size() >= 1
+        && data.customerCity.size() <= 80
+        && data.customerPhone is string
+        && data.customerPhone.size() >= 1
+        && data.customerPhone.size() <= 32
+        && isValidDateStr(data.issueDate)
+        && isValidDateStr(data.dueDate)
+        && (data.amount is int || data.amount is float)
+        && data.amount > 0
+        && data.amount <= 1000000000
+        && (data.paidAmount is int || data.paidAmount is float)
+        && data.paidAmount >= 0
+        && data.paidAmount <= data.amount
+        && (!('lastPaymentDate' in data) || isValidDateStr(data.lastPaymentDate))
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 300))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidExpense(data, userId, ledgerId) {
+      return data.keys().hasAll([
+          'ownerId', 'ledgerId', 'date', 'title', 'category', 'vendor', 'amount', 'paymentMode', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'ledgerId', 'date', 'title', 'category', 'vendor', 'amount', 'paymentMode', 'createdAt', 'updatedAt'
+        ])
+        && data.ownerId is string
+        && data.ownerId == userId
+        && isValidId(data.ownerId)
+        && data.ledgerId is string
+        && data.ledgerId == ledgerId
+        && isValidId(data.ledgerId)
+        && isValidDateStr(data.date)
+        && data.title is string
+        && data.title.size() >= 1
+        && data.title.size() <= 140
+        && data.category is string
+        && data.category.size() >= 1
+        && data.category.size() <= 60
+        && data.category in [
+          'Stock & Purchases',
+          'Transport & Freight',
+          'Rent & Utilities',
+          'Staff & Salaries',
+          'Marketing & Operations'
+        ]
+        && data.vendor is string
+        && data.vendor.size() >= 1
+        && data.vendor.size() <= 120
+        && (data.amount is int || data.amount is float)
+        && data.amount > 0
+        && data.amount <= 1000000000
+        && data.paymentMode is string
+        && data.paymentMode.size() >= 1
+        && data.paymentMode.size() <= 30
+        && data.paymentMode in ['UPI', 'Bank Transfer', 'Cash', 'Cheque']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    match /users/{userId}/private/profile {
+      allow get: if isOwner(userId) && isValidId(userId) && existing().uid == request.auth.uid;
+      allow create: if isOwner(userId)
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().updatedAt == request.time;
+      allow update: if isOwner(userId)
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'displayName', 'photoURL', 'updatedAt']);
+      allow delete: if isOwner(userId) && isValidId(userId) && existing().uid == request.auth.uid;
+    }
+
+    match /users/{userId}/ledgers/{ledgerId} {
+      allow get: if isOwner(userId)
+        && isValidId(userId)
+        && isValidId(ledgerId)
+        && existing().ownerId == request.auth.uid;
+      allow list: if isOwner(userId)
+        && isValidId(userId)
+        && resource.data.ownerId == request.auth.uid;
+      allow create: if isOwner(userId)
+        && isValidId(userId)
+        && isValidId(ledgerId)
+        && isValidLedger(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isOwner(userId)
+        && isValidId(userId)
+        && isValidId(ledgerId)
+        && isValidLedger(incoming(), userId)
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'name', 'segment', 'location', 'ownerName', 'referenceDate', 'updatedAt'
+        ]);
+      allow delete: if isOwner(userId)
+        && isValidId(userId)
+        && isValidId(ledgerId)
+        && existing().ownerId == request.auth.uid;
+
+      match /invoices/{invoiceId} {
+        allow get: if isValidId(userId)
+          && isValidId(ledgerId)
+          && isValidId(invoiceId)
+          && hasLedgerAccess(userId, ledgerId)
+          && existing().ownerId == request.auth.uid;
+        allow list: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(ledgerId)
+          && resource.data.ownerId == request.auth.uid
+          && resource.data.ledgerId == ledgerId;
+        allow create: if isValidId(userId)
+          && isValidId(ledgerId)
+          && isValidId(invoiceId)
+          && isOwner(userId)
+          && isValidInvoice(incoming(), userId, ledgerId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && hasLedgerAccess(userId, ledgerId);
+        allow update: if isValidId(userId)
+          && isValidId(ledgerId)
+          && isValidId(invoiceId)
+          && isOwner(userId)
+          && isValidInvoice(incoming(), userId, ledgerId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().ledgerId == existing().ledgerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && hasLedgerAccess(userId, ledgerId)
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['paidAmount', 'lastPaymentDate', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly([
+              'invoiceNumber', 'customerName', 'customerCity', 'customerPhone',
+              'issueDate', 'dueDate', 'amount', 'paidAmount', 'lastPaymentDate', 'notes', 'updatedAt'
+            ])
+          );
+        allow delete: if isValidId(userId)
+          && isValidId(ledgerId)
+          && isValidId(invoiceId)
+          && hasLedgerAccess(userId, ledgerId)
+          && existing().ownerId == request.auth.uid;
+      }
+
+      match /expenses/{expenseId} {
+        allow get: if isValidId(userId)
+          && isValidId(ledgerId)
+          && isValidId(expenseId)
+          && hasLedgerAccess(userId, ledgerId)
+          && existing().ownerId == request.auth.uid;
+        allow list: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(ledgerId)
+          && resource.data.ownerId == request.auth.uid
+          && resource.data.ledgerId == ledgerId;
+        allow create: if isValidId(userId)
+          && isValidId(ledgerId)
+          && isValidId(expenseId)
+          && isOwner(userId)
+          && isValidExpense(incoming(), userId, ledgerId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && hasLedgerAccess(userId, ledgerId);
+        allow update: if isValidId(userId)
+          && isValidId(ledgerId)
+          && isValidId(expenseId)
+          && isOwner(userId)
+          && isValidExpense(incoming(), userId, ledgerId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().ledgerId == existing().ledgerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && hasLedgerAccess(userId, ledgerId)
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'date', 'title', 'category', 'vendor', 'amount', 'paymentMode', 'updatedAt'
+          ]);
+        allow delete: if isValidId(userId)
+          && isValidId(ledgerId)
+          && isValidId(expenseId)
+          && hasLedgerAccess(userId, ledgerId)
+          && existing().ownerId == request.auth.uid;
+      }
+    }
+  }
+}

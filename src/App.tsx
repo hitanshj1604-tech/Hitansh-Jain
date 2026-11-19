@@ -1,15 +1,31 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { onAuthStateChanged, signInWithPopup, signOut, User } from 'firebase/auth';
 import {
   ArrowLeftRight,
   ChevronRight,
   FileSpreadsheet,
   LayoutDashboard,
+  LogOut,
   Menu,
   Plus,
   ReceiptIndianRupee,
-  Upload,
   X,
 } from 'lucide-react';
+import { auth, googleProvider } from './firebase';
+import {
+  batchImportExpenses,
+  batchImportInvoices,
+  createExpenseDoc,
+  createInvoiceDoc,
+  deleteExpenseDoc,
+  deleteInvoiceDoc,
+  ensureUserLedger,
+  recordInvoicePaymentDoc,
+  replaceCloudDataset,
+  saveUserProfile,
+  subscribeToUserLedger,
+  updateLedgerProfileDoc,
+} from './services/firestoreLedger';
 import {
   BusinessDataset,
   ExpenseRecord,
@@ -40,6 +56,27 @@ const NAV_ITEMS: Array<{
   { id: 'import', label: 'Import & Reports', icon: FileSpreadsheet },
 ];
 
+const GoogleGIcon: React.FC<{ className?: string }> = ({ className = 'w-4 h-4' }) => (
+  <svg className={className} viewBox="0 0 24 24" aria-hidden="true">
+    <path
+      fill="#4285F4"
+      d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17z"
+    />
+    <path
+      fill="#34A853"
+      d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24z"
+    />
+    <path
+      fill="#FBBC05"
+      d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14z"
+    />
+    <path
+      fill="#EA4335"
+      d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96z"
+    />
+  </svg>
+);
+
 export default function App() {
   const [dataset, setDataset] = useState<BusinessDataset>(() => {
     try {
@@ -56,6 +93,15 @@ export default function App() {
     return SAMPLE_DATASETS[0];
   });
 
+  const datasetRef = useRef(dataset);
+  datasetRef.current = dataset;
+
+  const [user, setUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [avatarFailed, setAvatarFailed] = useState(false);
+
   const [activeSection, setActiveSection] = useState<NavSection>('overview');
   const [period, setPeriod] = useState<PeriodFilter>('all');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -66,13 +112,125 @@ export default function App() {
   const [paymentInvoiceId, setPaymentInvoiceId] = useState<string | undefined>(undefined);
   const [reminderInvoice, setReminderInvoice] = useState<InvoiceRecord | null>(null);
 
+  // Save local copy when signed out
   useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(dataset));
-    } catch {
-      // Ignore storage quota issues
+    if (!user) {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(dataset));
+      } catch {
+        // Ignore storage quota issues
+      }
     }
-  }, [dataset]);
+  }, [dataset, user]);
+
+  // Firebase Auth listener + Firestore live ledger subscription
+  useEffect(() => {
+    let unsubLedger: (() => void) | null = null;
+    let cancelled = false;
+
+    const unsubAuth = onAuthStateChanged(auth, async (nextUser) => {
+      if (unsubLedger) {
+        unsubLedger();
+        unsubLedger = null;
+      }
+
+      setUser(nextUser);
+      setAvatarFailed(false);
+      setAuthReady(true);
+
+      if (!nextUser) {
+        return;
+      }
+
+      try {
+        await saveUserProfile(nextUser);
+        await ensureUserLedger(nextUser.uid, datasetRef.current);
+        if (cancelled) return;
+
+        unsubLedger = subscribeToUserLedger(nextUser.uid, {
+          onMeta: (meta) => {
+            setDataset((prev) => ({
+              ...prev,
+              id: 'primary',
+              ...meta,
+            }));
+          },
+          onInvoices: (invoices) => {
+            setDataset((prev) => ({
+              ...prev,
+              id: 'primary',
+              invoices,
+            }));
+          },
+          onExpenses: (expenses) => {
+            setDataset((prev) => ({
+              ...prev,
+              id: 'primary',
+              expenses,
+            }));
+          },
+        });
+      } catch (err) {
+        if (!cancelled) {
+          setAuthError(
+            err instanceof Error
+              ? err.message
+              : 'Could not sync your Google ledger. Please try again.'
+          );
+        }
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      if (unsubLedger) unsubLedger();
+      unsubAuth();
+    };
+  }, []);
+
+  const handleSignInWithGoogle = async () => {
+    setAuthError(null);
+    setAuthBusy(true);
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (err: unknown) {
+      const code = (err as { code?: string })?.code || '';
+      if (code === 'auth/popup-closed-by-user') {
+        setAuthError('Google sign-in popup was closed before completing.');
+      } else if (code === 'auth/popup-blocked') {
+        setAuthError('Popup was blocked by your browser. Please allow popups for this site.');
+      } else {
+        setAuthError(
+          err instanceof Error ? err.message : 'Google Sign-In failed. Please try again.'
+        );
+      }
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    setAuthError(null);
+    setAuthBusy(true);
+    try {
+      await signOut(auth);
+      try {
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (saved) {
+          const parsed = JSON.parse(saved) as BusinessDataset;
+          if (parsed && Array.isArray(parsed.invoices)) {
+            setDataset(parsed);
+            return;
+          }
+        }
+      } catch {
+        // Ignore parse error
+      }
+      setDataset(SAMPLE_DATASETS[0]);
+    } finally {
+      setAuthBusy(false);
+    }
+  };
 
   const summary = useMemo(
     () => computeFinancialSummary(dataset, period),
@@ -85,89 +243,131 @@ export default function App() {
     setEntryModalOpen(true);
   };
 
-  const handleAddInvoice = (newInv: Omit<InvoiceRecord, 'id'>) => {
-    setDataset((prev) => ({
-      ...prev,
-      invoices: [
-        { ...newInv, id: `inv-${Date.now()}` },
-        ...prev.invoices,
-      ],
-    }));
-  };
-
-  const handleAddExpense = (newExp: Omit<ExpenseRecord, 'id'>) => {
-    setDataset((prev) => ({
-      ...prev,
-      expenses: [
-        { ...newExp, id: `exp-${Date.now()}` },
-        ...prev.expenses,
-      ],
-    }));
-  };
-
-  const handleRecordPayment = (invoiceId: string, paymentAmount: number, paymentDate: string) => {
-    setDataset((prev) => ({
-      ...prev,
-      invoices: prev.invoices.map((inv) =>
-        inv.id === invoiceId
-          ? {
-              ...inv,
-              paidAmount: Math.min(inv.amount, inv.paidAmount + paymentAmount),
-              lastPaymentDate: paymentDate,
-            }
-          : inv
-      ),
-    }));
-  };
-
-  const handleDeleteInvoice = (invoiceId: string) => {
-    setDataset((prev) => ({
-      ...prev,
-      invoices: prev.invoices.filter((i) => i.id !== invoiceId),
-    }));
-  };
-
-  const handleDeleteExpense = (expenseId: string) => {
-    setDataset((prev) => ({
-      ...prev,
-      expenses: prev.expenses.filter((e) => e.id !== expenseId),
-    }));
-  };
-
-  const handleSelectPreset = (presetId: string) => {
-    const found = SAMPLE_DATASETS.find((d) => d.id === presetId);
-    if (found) {
-      setDataset(found);
-      setPeriod('all');
+  const handleAddInvoice = async (newInv: Omit<InvoiceRecord, 'id'>) => {
+    if (user) {
+      await createInvoiceDoc(user.uid, newInv);
+    } else {
+      setDataset((prev) => ({
+        ...prev,
+        invoices: [{ ...newInv, id: `inv-${Date.now()}` }, ...prev.invoices],
+      }));
     }
   };
 
-  const handleClearLedger = () => {
-    setDataset(createBlankDataset());
-    setPeriod('all');
+  const handleAddExpense = async (newExp: Omit<ExpenseRecord, 'id'>) => {
+    if (user) {
+      await createExpenseDoc(user.uid, newExp);
+    } else {
+      setDataset((prev) => ({
+        ...prev,
+        expenses: [{ ...newExp, id: `exp-${Date.now()}` }, ...prev.expenses],
+      }));
+    }
   };
 
-  const handleUpdateProfile = (
+  const handleRecordPayment = async (
+    invoiceId: string,
+    paymentAmount: number,
+    paymentDate: string
+  ) => {
+    const target = dataset.invoices.find((i) => i.id === invoiceId);
+    if (!target) return;
+    const updatedPaid = Math.min(target.amount, target.paidAmount + paymentAmount);
+    if (user) {
+      await recordInvoicePaymentDoc(user.uid, invoiceId, updatedPaid, paymentDate);
+    } else {
+      setDataset((prev) => ({
+        ...prev,
+        invoices: prev.invoices.map((inv) =>
+          inv.id === invoiceId
+            ? {
+                ...inv,
+                paidAmount: updatedPaid,
+                lastPaymentDate: paymentDate,
+              }
+            : inv
+        ),
+      }));
+    }
+  };
+
+  const handleDeleteInvoice = async (invoiceId: string) => {
+    if (user) {
+      await deleteInvoiceDoc(user.uid, invoiceId);
+    } else {
+      setDataset((prev) => ({
+        ...prev,
+        invoices: prev.invoices.filter((i) => i.id !== invoiceId),
+      }));
+    }
+  };
+
+  const handleDeleteExpense = async (expenseId: string) => {
+    if (user) {
+      await deleteExpenseDoc(user.uid, expenseId);
+    } else {
+      setDataset((prev) => ({
+        ...prev,
+        expenses: prev.expenses.filter((e) => e.id !== expenseId),
+      }));
+    }
+  };
+
+  const handleSelectPreset = async (presetId: string) => {
+    const found = SAMPLE_DATASETS.find((d) => d.id === presetId);
+    if (!found) return;
+    setPeriod('all');
+    if (user) {
+      await replaceCloudDataset(user.uid, found);
+    } else {
+      setDataset(found);
+    }
+  };
+
+  const handleClearLedger = async () => {
+    const blank = createBlankDataset();
+    setPeriod('all');
+    if (user) {
+      await replaceCloudDataset(user.uid, blank);
+    } else {
+      setDataset(blank);
+    }
+  };
+
+  const handleUpdateProfile = async (
     updates: Partial<Pick<BusinessDataset, 'name' | 'segment' | 'location' | 'ownerName'>>
   ) => {
-    setDataset((prev) => ({ ...prev, ...updates }));
+    if (user) {
+      await updateLedgerProfileDoc(user.uid, updates);
+    } else {
+      setDataset((prev) => ({ ...prev, ...updates }));
+    }
   };
 
-  const handleImportInvoices = (records: InvoiceRecord[], replaceExisting: boolean) => {
-    setDataset((prev) => ({
-      ...prev,
-      invoices: replaceExisting ? records : [...records, ...prev.invoices],
-    }));
+  const handleImportInvoices = async (records: InvoiceRecord[], replaceExisting: boolean) => {
+    if (user) {
+      await batchImportInvoices(user.uid, records, replaceExisting);
+    } else {
+      setDataset((prev) => ({
+        ...prev,
+        invoices: replaceExisting ? records : [...records, ...prev.invoices],
+      }));
+    }
   };
 
-  const handleImportExpenses = (records: ExpenseRecord[], replaceExisting: boolean) => {
-    setDataset((prev) => ({
-      ...prev,
-      expenses: replaceExisting ? records : [...records, ...prev.expenses],
-    }));
+  const handleImportExpenses = async (records: ExpenseRecord[], replaceExisting: boolean) => {
+    if (user) {
+      await batchImportExpenses(user.uid, records, replaceExisting);
+    } else {
+      setDataset((prev) => ({
+        ...prev,
+        expenses: replaceExisting ? records : [...records, ...prev.expenses],
+      }));
+    }
   };
 
   const activeNavLabel = NAV_ITEMS.find((n) => n.id === activeSection)?.label || 'Overview';
+  const userInitial = (user?.displayName || user?.email || 'U').charAt(0).toUpperCase();
 
   const SidebarContent = (
     <div className="flex flex-col h-full bg-white border-r border-slate-200">
@@ -233,28 +433,53 @@ export default function App() {
         })}
       </nav>
 
-      {/* Active Business Switcher in Sidebar Footer */}
+      {/* Active Business & Google Account Footer */}
       <div className="p-4 border-t border-slate-200 space-y-3">
         <div>
-          <div className="text-xs font-medium text-slate-400">Active Business</div>
+          <div className="text-xs font-medium text-slate-400">
+            {user ? 'Synced to Google' : 'Local Demo Ledger'}
+          </div>
           <div className="text-xs font-semibold text-slate-900 truncate mt-0.5">
             {dataset.name}
           </div>
           <div className="text-xs text-slate-500 tabular-nums mt-0.5">
-            Overdue: <span className="font-mono text-red-700">{formatINRCompact(summary.overdueAmount)}</span>
+            Overdue:{' '}
+            <span className="font-mono text-red-700">
+              {formatINRCompact(summary.overdueAmount)}
+            </span>
           </div>
         </div>
 
-        <button
-          type="button"
-          onClick={() => {
-            setActiveSection('import');
-            setMobileMenuOpen(false);
-          }}
-          className="w-full py-2 px-3 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors text-center whitespace-nowrap"
-        >
-          Switch Dataset / Import CSV
-        </button>
+        {user ? (
+          <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-100">
+            <div className="min-w-0">
+              <div className="text-xs font-medium text-slate-800 truncate">
+                {user.displayName || 'Google User'}
+              </div>
+              <div className="text-[11px] text-slate-500 truncate">{user.email}</div>
+            </div>
+            <button
+              type="button"
+              onClick={handleSignOut}
+              disabled={authBusy}
+              className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-md transition-colors shrink-0"
+              title="Sign out"
+              aria-label="Sign out"
+            >
+              <LogOut className="w-4 h-4" />
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={handleSignInWithGoogle}
+            disabled={authBusy || !authReady}
+            className="w-full inline-flex items-center justify-center gap-2 py-2 px-3 text-xs font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
+          >
+            <GoogleGIcon className="w-3.5 h-3.5" />
+            Sign in with Google
+          </button>
+        )}
       </div>
     </div>
   );
@@ -279,7 +504,7 @@ export default function App() {
 
       {/* Main Content Area */}
       <div className="flex-1 min-w-0 flex flex-col">
-        {/* Top Bar Contract: Breadcrumb on left, max 2 primary actions on right */}
+        {/* Top Bar Contract: Breadcrumb on left, Google Sign-In / Profile + Record Entry on right */}
         <header className="sticky top-0 z-30 h-16 bg-white/95 backdrop-blur-xs border-b border-slate-200 px-4 sm:px-6 lg:px-8 flex items-center justify-between gap-4">
           <div className="flex items-center gap-3 min-w-0">
             <button
@@ -299,14 +524,44 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2.5 shrink-0">
-            <button
-              type="button"
-              onClick={() => setActiveSection('import')}
-              className="hidden sm:inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap shrink-0"
-            >
-              <Upload className="w-3.5 h-3.5" />
-              Import Data
-            </button>
+            {user ? (
+              <div className="hidden sm:inline-flex items-center gap-2.5 pr-1">
+                {user.photoURL && !avatarFailed ? (
+                  <img
+                    src={user.photoURL}
+                    alt={user.displayName || 'User avatar'}
+                    referrerPolicy="no-referrer"
+                    onError={() => setAvatarFailed(true)}
+                    className="w-7 h-7 rounded-full object-cover border border-slate-200"
+                  />
+                ) : (
+                  <span className="w-7 h-7 rounded-full bg-slate-200 text-slate-700 text-xs font-semibold flex items-center justify-center">
+                    {userInitial}
+                  </span>
+                )}
+                <span className="text-xs font-medium text-slate-700 max-w-[140px] truncate">
+                  {user.displayName || user.email}
+                </span>
+                <button
+                  type="button"
+                  onClick={handleSignOut}
+                  disabled={authBusy}
+                  className="px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-100 rounded-md transition-colors whitespace-nowrap shrink-0"
+                >
+                  Sign out
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={handleSignInWithGoogle}
+                disabled={authBusy || !authReady}
+                className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap shrink-0 disabled:opacity-50"
+              >
+                <GoogleGIcon className="w-3.5 h-3.5" />
+                <span>{authBusy ? 'Signing in...' : 'Sign in with Google'}</span>
+              </button>
+            )}
 
             <button
               type="button"
@@ -318,6 +573,19 @@ export default function App() {
             </button>
           </div>
         </header>
+
+        {authError && (
+          <div className="bg-red-50 border-b border-red-200 px-4 sm:px-6 lg:px-8 py-2.5 flex items-center justify-between gap-4 text-xs text-red-700">
+            <span>{authError}</span>
+            <button
+              type="button"
+              onClick={() => setAuthError(null)}
+              className="text-red-700 hover:text-red-900 font-medium whitespace-nowrap"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
 
         {/* Viewport Container */}
         <main className="flex-1 w-full max-w-[1280px] mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8">

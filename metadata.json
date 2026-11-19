@@ -1,0 +1,6 @@
+{
+  "name": "FinSight",
+  "description": "Simple financial analytics, receivables tracking, and cash-flow dashboard for small distributors, dealers, and growing businesses.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
